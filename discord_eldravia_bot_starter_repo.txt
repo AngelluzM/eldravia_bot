@@ -1,0 +1,506 @@
+# Discord Eldravia Bot — Starter Repo
+
+Below is a minimal-yet-solid starter you can push to GitHub and run on Discord. It includes:
+- Slash commands for dice rolls, macros, and a simple Eldravia character sheet (stored per user)
+- Quick-roll button panel and macro management
+- SQLite persistence
+
+---
+
+## File: `package.json`
+```json
+{
+  "name": "eldravia-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot com rolagem de dados, macros e ficha Eldravia (formulário)",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "register": "node src/registerCommands.js"
+  },
+  "dependencies": {
+    "discord.js": "14.16.3",
+    "dotenv": "16.4.5",
+    "sqlite3": "5.1.7"
+  }
+}
+```
+
+---
+
+## File: `.env.example`
+```env
+DISCORD_TOKEN=coloque_o_token_do_bot_aqui
+DISCORD_CLIENT_ID=coloque_o_client_id_da_aplicacao
+# Opcional: limite de canais/servidores para registro por guild (para debug):
+# GUILD_ID=se_quiser_registrar_somente_em_um_servidor
+```
+
+---
+
+## File: `src/index.js`
+```js
+import 'dotenv/config';
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  Collection,
+  InteractionType,
+  REST,
+  Routes,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
+} from 'discord.js';
+import { ensureDb } from './storage.js';
+import { parseAndRoll } from './lib/dice.js';
+import { upsertSheet, getSheet, exportSheet, importSheet } from './sheetStore.js';
+import { saveMacro, runMacro, listMacros, deleteMacro } from './macroStore.js';
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  partials: [Partials.Channel]
+});
+
+client.commands = new Collection();
+
+client.once('ready', async () => {
+  await ensureDb();
+  console.log(`✅ Logado como ${client.user.tag}`);
+});
+
+// =============
+// Interactions
+// =============
+client.on('interactionCreate', async (interaction) => {
+  try {
+    // Slash commands
+    if (interaction.isChatInputCommand()) {
+      const { commandName } = interaction;
+      if (commandName === 'roll') {
+        const formula = interaction.options.getString('formula');
+        if (!formula) return interaction.reply({ content: 'Informe uma fórmula (ex.: 1d20+5, 3d6-1, adv d20+3).', ephemeral: true });
+        const result = parseAndRoll(formula);
+        return interaction.reply(result.reply);
+      }
+
+      if (commandName === 'panel') {
+        const row1 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('roll:d20').setLabel('d20').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('roll:d12').setLabel('d12').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('roll:d10').setLabel('d10').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('roll:d8').setLabel('d8').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('roll:d6').setLabel('d6').setStyle(ButtonStyle.Secondary)
+        );
+        const row2 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('roll:d4').setLabel('d4').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('roll:adv_d20').setLabel('adv d20').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId('roll:dis_d20').setLabel('dis d20').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('macro:list').setLabel('Macros').setStyle(ButtonStyle.Secondary)
+        );
+        return interaction.reply({ content: '🎲 Painel de Rolagens', components: [row1, row2] });
+      }
+
+      if (commandName === 'macro') {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'save') {
+          const name = interaction.options.getString('nome');
+          const formula = interaction.options.getString('formula');
+          await saveMacro(interaction.user.id, name, formula);
+          return interaction.reply(`💾 Macro **${name}** salva: \`${formula}\``);
+        }
+        if (sub === 'run') {
+          const name = interaction.options.getString('nome');
+          const formula = await runMacro(interaction.user.id, name);
+          if (!formula) return interaction.reply({ content: 'Macro não encontrada.', ephemeral: true });
+          const result = parseAndRoll(formula);
+          return interaction.reply(result.reply);
+        }
+        if (sub === 'list') {
+          const macros = await listMacros(interaction.user.id);
+          if (!macros.length) return interaction.reply({ content: 'Você não tem macros.', ephemeral: true });
+          const embed = new EmbedBuilder().setTitle('📜 Macros').setDescription(macros.map(m => `**${m.name}** → \`${m.formula}\``).join('\n'));
+          return interaction.reply({ embeds: [embed] });
+        }
+        if (sub === 'delete') {
+          const name = interaction.options.getString('nome');
+          const ok = await deleteMacro(interaction.user.id, name);
+          return interaction.reply(ok ? `🗑️ Macro **${name}** removida.` : 'Macro não encontrada.');
+        }
+      }
+
+      if (commandName === 'sheet') {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'view') {
+          const data = await getSheet(interaction.user.id);
+          if (!data) return interaction.reply({ content: 'Você ainda não tem ficha. Use `/sheet edit` para criar.', ephemeral: true });
+          const embed = new EmbedBuilder()
+            .setTitle(`📘 Ficha de ${data.nome || interaction.user.username}`)
+            .addFields(
+              { name: 'Classe', value: data.classe || '—', inline: true },
+              { name: 'Nível', value: String(data.nivel ?? '—'), inline: true },
+              { name: 'PV', value: String(data.pv ?? '—'), inline: true },
+              { name: 'Mana', value: String(data.mana ?? '—'), inline: true },
+              { name: 'Observações', value: data.obs || '—' }
+            )
+            .setFooter({ text: 'Eldravia — campos livres (sem validações automáticas por enquanto)' });
+          return interaction.reply({ embeds: [embed] });
+        }
+        if (sub === 'edit') {
+          const sheet = await getSheet(interaction.user.id) || {};
+          const modal = new ModalBuilder().setCustomId('sheet:edit').setTitle('Editar Ficha — Eldravia');
+          const nome = new TextInputBuilder().setCustomId('s_nome').setLabel('Nome').setStyle(TextInputStyle.Short).setRequired(false).setValue(sheet.nome || '');
+          const classe = new TextInputBuilder().setCustomId('s_classe').setLabel('Classe/Arquétipo').setStyle(TextInputStyle.Short).setRequired(false).setValue(sheet.classe || '');
+          const nivel = new TextInputBuilder().setCustomId('s_nivel').setLabel('Nível').setStyle(TextInputStyle.Short).setRequired(false).setValue(String(sheet.nivel ?? ''));
+          const pv = new TextInputBuilder().setCustomId('s_pv').setLabel('PV').setStyle(TextInputStyle.Short).setRequired(false).setValue(String(sheet.pv ?? ''));
+          const mana = new TextInputBuilder().setCustomId('s_mana').setLabel('Mana').setStyle(TextInputStyle.Short).setRequired(false).setValue(String(sheet.mana ?? ''));
+          const obs = new TextInputBuilder().setCustomId('s_obs').setLabel('Observações').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(sheet.obs || '');
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(nome),
+            new ActionRowBuilder().addComponents(classe),
+            new ActionRowBuilder().addComponents(nivel),
+            new ActionRowBuilder().addComponents(pv),
+            new ActionRowBuilder().addComponents(mana)
+          );
+          // Discord limita 5 inputs por modal; se quiser OBS, usamos um segundo modal no futuro
+          await interaction.showModal(modal);
+          return;
+        }
+        if (sub === 'export') {
+          const json = await exportSheet(interaction.user.id);
+          return interaction.reply({ files: [{ attachment: Buffer.from(json), name: 'ficha-eldravia.json' }] });
+        }
+        if (sub === 'import') {
+          const json = interaction.options.getString('json');
+          try {
+            const data = JSON.parse(json);
+            await importSheet(interaction.user.id, data);
+            return interaction.reply('📥 Ficha importada com sucesso.');
+          } catch (e) {
+            return interaction.reply({ content: 'JSON inválido.', ephemeral: true });
+          }
+        }
+      }
+    }
+
+    // Buttons
+    if (interaction.isButton()) {
+      const id = interaction.customId;
+      if (id.startsWith('roll:')) {
+        const key = id.split(':')[1];
+        let formula = '1d20';
+        if (key === 'd12') formula = '1d12';
+        if (key === 'd10') formula = '1d10';
+        if (key === 'd8') formula = '1d8';
+        if (key === 'd6') formula = '1d6';
+        if (key === 'd4') formula = '1d4';
+        if (key === 'adv_d20') formula = 'adv d20';
+        if (key === 'dis_d20') formula = 'dis d20';
+        const result = parseAndRoll(formula);
+        return interaction.reply(result.reply);
+      }
+      if (id === 'macro:list') {
+        const macros = await listMacros(interaction.user.id);
+        if (!macros.length) return interaction.reply({ content: 'Você não tem macros.', ephemeral: true });
+        const embed = new EmbedBuilder().setTitle('📜 Macros').setDescription(macros.map(m => `**${m.name}** → \`${m.formula}\``).join('\n'));
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+    }
+
+    // Modals submit
+    if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'sheet:edit') {
+      const data = {
+        nome: interaction.fields.getTextInputValue('s_nome') || undefined,
+        classe: interaction.fields.getTextInputValue('s_classe') || undefined,
+        nivel: safeInt(interaction.fields.getTextInputValue('s_nivel')),
+        pv: safeInt(interaction.fields.getTextInputValue('s_pv')),
+        mana: safeInt(interaction.fields.getTextInputValue('s_mana')),
+        // OBS omitido por limite de 5 campos no modal
+      };
+      await upsertSheet(interaction.user.id, data);
+      return interaction.reply('💾 Ficha salva. Use `/sheet view` para visualizar ou `/sheet export` para baixar.');
+    }
+  } catch (err) {
+    console.error(err);
+    if (interaction.deferred || interaction.replied) {
+      return interaction.followUp({ content: 'Erro interno.', ephemeral: true });
+    }
+    return interaction.reply({ content: 'Erro interno.', ephemeral: true });
+  }
+});
+
+function safeInt(v) {
+  const n = parseInt(String(v).replace(/\D+/g, ''), 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+client.login(process.env.DISCORD_TOKEN);
+```
+
+---
+
+## File: `src/registerCommands.js`
+```js
+import 'dotenv/config';
+import { REST, Routes, SlashCommandBuilder } from 'discord.js';
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('roll')
+    .setDescription('Rolar dados por fórmula (ex.: 1d20+5, 3d6-1, adv d20)')
+    .addStringOption(o => o.setName('formula').setDescription('Fórmula de rolagem').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('panel')
+    .setDescription('Exibe painel de botões para rolar dados'),
+
+  new SlashCommandBuilder()
+    .setName('macro')
+    .setDescription('Gerenciar macros de rolagem')
+    .addSubcommand(s => s.setName('save').setDescription('Salvar macro')
+      .addStringOption(o => o.setName('nome').setDescription('Nome').setRequired(true))
+      .addStringOption(o => o.setName('formula').setDescription('Fórmula').setRequired(true)))
+    .addSubcommand(s => s.setName('run').setDescription('Executar macro')
+      .addStringOption(o => o.setName('nome').setDescription('Nome').setRequired(true)))
+    .addSubcommand(s => s.setName('list').setDescription('Listar suas macros'))
+    .addSubcommand(s => s.setName('delete').setDescription('Remover macro')
+      .addStringOption(o => o.setName('nome').setDescription('Nome').setRequired(true))),
+
+  new SlashCommandBuilder()
+    .setName('sheet')
+    .setDescription('Ficha Eldravia (formulário e export/import)')
+    .addSubcommand(s => s.setName('view').setDescription('Ver sua ficha'))
+    .addSubcommand(s => s.setName('edit').setDescription('Editar sua ficha'))
+    .addSubcommand(s => s.setName('export').setDescription('Exportar JSON da sua ficha'))
+    .addSubcommand(s => s.setName('import').setDescription('Importar JSON da sua ficha')
+      .addStringOption(o => o.setName('json').setDescription('Conteúdo JSON').setRequired(true)))
+].map(c => c.toJSON());
+
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+async function main() {
+  try {
+    if (process.env.GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.GUILD_ID), { body: commands });
+      console.log('✅ Comandos registrados (GUILD)');
+    } else {
+      await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
+      console.log('✅ Comandos registrados (GLOBAL)');
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+main();
+```
+
+---
+
+## File: `src/lib/dice.js`
+```js
+// Suporta: NdM [+/- modificador], "adv" / "dis" (vantagem/desvantagem)
+// Exemplos: 1d20+5, 3d6-1, adv d20+3, dis d20
+
+export function parseAndRoll(input) {
+  const txt = String(input).trim().toLowerCase();
+  let advantage = 0; // 1 = adv, -1 = dis, 0 = normal
+  let expr = txt;
+  if (txt.startsWith('adv ')) { advantage = 1; expr = txt.slice(4); }
+  else if (txt.startsWith('dis ')) { advantage = -1; expr = txt.slice(4); }
+
+  // Padrão básico: NdM +/- K  | ou apenas dM | ou apenas número
+  const m = expr.match(/^(\d*)d(\d+)(\s*[+\-]\s*\d+)?$/);
+  if (!m) {
+    // aceitar também: d20, d6+2
+    const m2 = expr.match(/^d(\d+)(\s*[+\-]\s*\d+)?$/);
+    if (!m2) return { reply: { content: 'Formato inválido. Use algo como `1d20+5`, `3d6-1`, `adv d20+3`.', ephemeral: true } };
+    m2.splice(1, 0, '1'); // injeta quantidade 1
+    m2[0] = `1d${m2[1]}${m2[2] || ''}`;
+    return parseParsed(m2, advantage);
+  }
+  return parseParsed(m, advantage);
+}
+
+function parseParsed(match, advantage) {
+  const qtd = parseInt(match[1] || '1', 10);
+  const faces = parseInt(match[2], 10);
+  const mod = match[3] ? parseInt(match[3].replace(/\s/g, ''), 10) : 0;
+
+  if (qtd < 1 || faces < 2 || qtd > 1000 || faces > 1000) {
+    return { reply: { content: 'Limites: 1–1000 dados, 2–1000 faces.', ephemeral: true } };
+  }
+
+  // Vantagem/Desvantagem aplica-se ao melhor/ pior de 2 rolagens do PRIMEIRO dado quando qtd=1
+  // (comportamento simples e útil para testes baseados em d20).
+  let rolls = [];
+  if (advantage !== 0 && qtd === 1) {
+    const a = rollDie(faces);
+    const b = rollDie(faces);
+    const chosen = advantage > 0 ? Math.max(a, b) : Math.min(a, b);
+    rolls = [chosen];
+  } else {
+    for (let i = 0; i < qtd; i++) rolls.push(rollDie(faces));
+  }
+
+  const total = rolls.reduce((s, n) => s + n, 0) + mod;
+
+  const detail = `(${rolls.join(' + ')}${mod ? (mod > 0 ? ` + ${mod}` : ` - ${Math.abs(mod)}`) : ''})`;
+  const title = `🎲 ${qtd}d${faces}${mod ? (mod > 0 ? `+${mod}` : `${mod}`) : ''}` + (advantage === 1 ? ' (adv)' : advantage === -1 ? ' (dis)' : '');
+
+  return {
+    reply: {
+      content: `${title} = **${total}**\n${detail}`
+    }
+  };
+}
+
+function rollDie(f) { return 1 + Math.floor(Math.random() * f); }
+```
+
+---
+
+## File: `src/storage.js`
+```js
+import sqlite3 from 'sqlite3';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DB_PATH = path.join(__dirname, '..', 'eldravia.db');
+
+export let db;
+
+export async function ensureDb() {
+  if (db) return db;
+  sqlite3.verbose();
+  db = new sqlite3.Database(DB_PATH);
+  await run(`CREATE TABLE IF NOT EXISTS sheets (
+    user_id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`);
+  await run(`CREATE TABLE IF NOT EXISTS macros (
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    formula TEXT NOT NULL,
+    PRIMARY KEY (user_id, name)
+  )`);
+  return db;
+}
+
+export function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve(this);
+    });
+  });
+}
+
+export function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows);
+    });
+  });
+}
+
+export function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row);
+    });
+  });
+}
+```
+
+---
+
+## File: `src/sheetStore.js`
+```js
+import { run, get } from './storage.js';
+
+export async function getSheet(userId) {
+  const row = await get('SELECT data FROM sheets WHERE user_id = ?', [userId]);
+  if (!row) return null;
+  try { return JSON.parse(row.data); } catch { return null; }
+}
+
+export async function upsertSheet(userId, partial) {
+  const current = (await getSheet(userId)) || {};
+  const merged = { ...current, ...partial };
+  await run('INSERT INTO sheets(user_id, data) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET data = excluded.data', [userId, JSON.stringify(merged)]);
+  return merged;
+}
+
+export async function exportSheet(userId) {
+  const data = await getSheet(userId);
+  return JSON.stringify(data || {}, null, 2);
+}
+
+export async function importSheet(userId, obj) {
+  if (typeof obj !== 'object' || Array.isArray(obj)) throw new Error('bad json');
+  await run('INSERT INTO sheets(user_id, data) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET data = excluded.data', [userId, JSON.stringify(obj)]);
+}
+```
+
+---
+
+## File: `src/macroStore.js`
+```js
+import { run, all, get } from './storage.js';
+
+export async function saveMacro(userId, name, formula) {
+  await run('INSERT INTO macros(user_id, name, formula) VALUES (?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET formula = excluded.formula', [userId, name, formula]);
+}
+
+export async function runMacro(userId, name) {
+  const row = await get('SELECT formula FROM macros WHERE user_id = ? AND name = ?', [userId, name]);
+  return row?.formula || null;
+}
+
+export async function listMacros(userId) {
+  return await all('SELECT name, formula FROM macros WHERE user_id = ? ORDER BY name', [userId]);
+}
+
+export async function deleteMacro(userId, name) {
+  const res = await run('DELETE FROM macros WHERE user_id = ? AND name = ?', [userId, name]);
+  return res.changes > 0;
+}
+```
+
+---
+
+## File: `README.md`
+```md
+# Eldravia Discord Bot
+
+Bot de Discord com:
+- `/roll` para rolagens (`1d20+5`, `3d6-1`, `adv d20`, `dis d20`)
+- `/panel` para botões rápidos (d20…d4, adv/dis)
+- Macros: `/macro save|run|list|delete`
+- Ficha Eldravia simples por usuário: `/sheet view|edit|export|import`
+
+## Setup
+1. Crie um app/bot em <https://discord.com/developers/applications>, pegue o **CLIENT ID** e o **TOKEN**.
+2. Copie `.env.example` para `.env` e preencha.
+3. Instale deps: `npm i`
+4. Registre os comandos:
+   - Por servidor (dev): defina `GUILD_ID` no `.env` e rode `npm run register`.
+   - Global: remova `GUILD_ID` e rode `npm run register` (propagação pode demorar alguns minutos).
+5. Inicie: `npm start`
+6. Convide o bot usando o OAuth2 URL do Developer Portal (escopos **bot** e **applications.commands**, permissões mínimas: enviar mensagens e usar comandos de barra).
+
+## Observações
+- A ficha atual é um formulário básico (sem validação de regras). Campos extras podem ser adicionados criando mais modais ou comandos.
+- Para logs de rolagem persistentes: **não requisitado**. O bot apenas responde a cada rolagem.
+- Banco: `eldravia.db` na raiz `src/..` (SQLite). Faça backup se necessário.
